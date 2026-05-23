@@ -1,0 +1,9 @@
+strategies:
+  - name: pairs_trading
+    module: pairs_trading_system
+    enabled: true
+    capital_weight: 1.0
+    config:
+      PAIR_DISCOVERY_MODULE: find_correlated_assets
+      RUN_LIVE: true
+      BAR_TIMEFRAME: "1Hour"

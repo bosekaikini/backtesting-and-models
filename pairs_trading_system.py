@@ -12,17 +12,19 @@ CONFIG = {
     # ── Mode toggle ──────────────────────────────────────────────────────────
     # False → run vectorized backtest only
     # True  → connect WebSocket and execute live trades
-    "RUN_LIVE": False,
+    "RUN_LIVE": True,
 
     # ── Pair selection ───────────────────────────────────────────────────────
+    "PAIR_DISCOVERY_MODULE": "find_correlated_assets",
+    "SIGNAL_ENGINE_MODULE": None,
     "ASSET_A": "GLD",   # e.g. GLD / IAU, SPY / IVV, XOM / CVX
     "ASSET_B": "IAU",
 
     # ── Strategy parameters ──────────────────────────────────────────────────
-    "Z_ENTRY":     2.0,    # |Z| threshold to open a position
+    "Z_ENTRY":     1.5,    # |Z| threshold to open a position
     "Z_EXIT":      0.0,    # |Z| threshold to close a position
     "Z_STOPLOSS":  3.5,    # emergency stop
-    "LOOKBACK":    60,     # rolling window (bars) for OU calibration
+    "LOOKBACK":    30,     # rolling window (bars) for OU calibration
     "MIN_HALF_LIFE": 2,    # minimum acceptable half-life (bars)
     "MAX_HALF_LIFE": 120,  # maximum acceptable half-life (bars)
 
@@ -42,13 +44,16 @@ CONFIG = {
 
 
 import asyncio
+import contextlib
 import logging
+from logging.handlers import RotatingFileHandler
 import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -60,18 +65,33 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.enums import DataFeed
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.live import StockDataStream
+from alpaca_data_utils import fetch_stock_bars_frame
+from strategy_loader import build_signal_engine, discover_trade_pair
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+LOG_FILE = "trade_activity.log"
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
+
+file_handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=1_000_000,
+    backupCount=3,
+    encoding="utf-8",
 )
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
+
+logging.basicConfig(level=logging.INFO, handlers=[console_handler, file_handler])
 log = logging.getLogger("PairsTrader")
 
 
@@ -110,6 +130,13 @@ class Position:
     pnl: float = 0.0
 
 
+@dataclass
+class PendingSignal:
+    signal: Signal
+    queued_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    reason: str = ""
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # COMPONENT 2 — OUModelEngine
 # ═════════════════════════════════════════════════════════════════════════════
@@ -123,8 +150,8 @@ class OUModelEngine:
 
     def __init__(
         self,
-        lookback: int = 60,
-        z_entry: float = 2.0,
+        lookback: int = 30,
+        z_entry: float = 1.5,
         z_exit: float = 0.0,
         z_stop: float = 3.5,
         min_half_life: float = 2,
@@ -206,7 +233,7 @@ class OUModelEngine:
             spread = prices_a - hedge * prices_b
 
             # Stationarity check
-            adf_stat, adf_pvalue, *_ = adfuller(spread, maxlags=1, autolag=None)
+            adf_stat, adf_pvalue, *_ = adfuller(spread, maxlag=1, autolag=None)
             if adf_pvalue > 0.10:   # relaxed for rolling windows
                 return OUParams()
 
@@ -589,7 +616,7 @@ class AlpacaTradingBot:
     RECONNECT_DELAY = 5    # seconds before WebSocket reconnect attempt
     MAX_RECONNECTS  = 20
 
-    def __init__(self, config: dict, kelly_p: float = 0.5, kelly_b: float = 1.0):
+    def __init__(self, config: dict, kelly_p: float = 0.5, kelly_b: float = 1.0, engine=None):
         self.cfg = config
         self.asset_a = config["ASSET_A"]
         self.asset_b = config["ASSET_B"]
@@ -601,7 +628,7 @@ class AlpacaTradingBot:
         self.position = Position()
 
         # OU engine
-        self.engine = OUModelEngine(
+        self.engine = engine or OUModelEngine(
             lookback=config["LOOKBACK"],
             z_entry=config["Z_ENTRY"],
             z_exit=config["Z_EXIT"],
@@ -617,6 +644,8 @@ class AlpacaTradingBot:
         # Latest prices buffer for fractional share calculation
         self._latest_price: Dict[str, float] = {self.asset_a: 0.0, self.asset_b: 0.0}
         self._reconnect_count = 0
+        self.pending_signal: Optional[PendingSignal] = None
+        self._pending_signal_task: Optional[asyncio.Task] = None
 
         # Alpaca REST client
         self.trading_client = TradingClient(
@@ -631,7 +660,65 @@ class AlpacaTradingBot:
             secret_key=config["SECRET_KEY"],
         )
 
+        # Optional runtime helpers injected by orchestrator
+        self.results_store = config.get("RESULTS_STORE")
+        self.risk_manager = config.get("RISK_MANAGER")
+        self.strategy_name = config.get("STRATEGY_NAME", "pairs_trading")
+        self._last_exposure = 0.0
+
         log.info("AlpacaTradingBot initialised for %s / %s", self.asset_a, self.asset_b)
+
+    def _market_is_open(self) -> bool:
+        try:
+            return bool(self.trading_client.get_clock().is_open)
+        except Exception as exc:
+            log.warning("Market clock unavailable (%s). Falling back to ET session check.", exc)
+            now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+            if now_et.weekday() >= 5:
+                return False
+            return (now_et.hour, now_et.minute) >= (9, 30) and (now_et.hour, now_et.minute) < (16, 0)
+
+    def _queue_signal(self, signal: Signal, reason: str):
+        self.pending_signal = PendingSignal(signal=signal, reason=reason)
+        log.info(
+            "QUEUED SIGNAL | reason=%s direction=%+d z=%.3f valid=%s",
+            reason,
+            signal.direction,
+            signal.z_score,
+            signal.ou.valid,
+        )
+
+    async def _apply_signal(self, signal: Signal):
+        needs_action = signal.direction != (self.position.direction if self.position.active else 0)
+        if not needs_action:
+            return
+
+        if signal.direction == 0 and self.position.active:
+            log.info("EXIT SIGNAL | z=%.3f", signal.z_score)
+            await self._close_all()
+            return
+
+        if signal.direction != 0:
+            log.info("ENTRY SIGNAL | direction=%+d z=%.3f", signal.direction, signal.z_score)
+            if self.position.active:
+                await self._close_all()
+            await self._execute_orders(signal)
+
+    async def _pending_signal_loop(self):
+        while True:
+            await asyncio.sleep(60)
+            if self.pending_signal is None:
+                continue
+            if not self._market_is_open():
+                continue
+            queued = self.pending_signal
+            self.pending_signal = None
+            log.info(
+                "MARKET OPEN | executing queued signal from %s (%s)",
+                queued.queued_at.isoformat(),
+                queued.reason,
+            )
+            await self._apply_signal(queued.signal)
 
     # ── Kelly-based position sizing ───────────────────────────────────────────
 
@@ -665,9 +752,17 @@ class AlpacaTradingBot:
             timeframe=tf,
             limit=self.cfg["LOOKBACK"] + 10,
         )
-        bars = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: self.hist_client.get_stock_bars(request)
-        )
+
+        try:
+            bars = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.hist_client.get_stock_bars(request)
+            )
+        except Exception as exc:
+            log.warning(
+                "Warm-up data fetch failed (%s). Continuing with a cold start.",
+                exc,
+            )
+            return False
 
         df_map: Dict[str, pd.DataFrame] = {}
         for sym in [self.asset_a, self.asset_b]:
@@ -680,7 +775,7 @@ class AlpacaTradingBot:
 
         if self.asset_a not in df_map or self.asset_b not in df_map:
             log.error("Warm-up failed — missing bars. Proceeding with cold start.")
-            return
+            return False
 
         prices_a = df_map[self.asset_a]
         prices_b = df_map[self.asset_b]
@@ -694,6 +789,7 @@ class AlpacaTradingBot:
             self._latest_price[self.asset_b] = prices_b[i]
 
         log.info("Warm-up complete. Buffer: %d bars.", len(self.engine._prices_a))
+        return True
 
     # ── Order execution ───────────────────────────────────────────────────────
 
@@ -706,6 +802,16 @@ class AlpacaTradingBot:
         if alloc < 1.0:
             log.warning("Allocation too small ($%.2f). Skipping trade.", alloc)
             return
+
+        # Risk check (per-strategy and cross-strategy)
+        if self.risk_manager:
+            try:
+                allowed = self.risk_manager.can_execute_order(self.strategy_name, alloc)
+            except Exception:
+                allowed = True
+            if not allowed:
+                log.warning("RiskManager blocked order for %s (alloc=$%.2f)", self.strategy_name, alloc)
+                return
 
         pa = self._latest_price[self.asset_a]
         pb = self._latest_price[self.asset_b]
@@ -768,6 +874,28 @@ class AlpacaTradingBot:
                 "POSITION UPDATE | direction=%+d z=%.3f spread=%.4f",
                 signal.direction, signal.z_score, signal.spread,
             )
+            # record exposure and persistence
+            exposure_notional = qty_a_notional + qty_b_notional
+            self._last_exposure = exposure_notional
+            if self.risk_manager:
+                try:
+                    self.risk_manager.record_exposure(self.strategy_name, exposure_notional)
+                except Exception:
+                    pass
+            if self.results_store:
+                try:
+                    from datetime import datetime
+                    self.results_store.save_trade_event({
+                        "ts": datetime.now().isoformat(),
+                        "strategy": self.strategy_name,
+                        "symbol": f"{self.asset_a}/{self.asset_b}",
+                        "side": "ENTRY",
+                        "qty": exposure_notional,
+                        "price": float(pa),
+                        "note": f"entry_z={signal.z_score}",
+                    })
+                except Exception:
+                    log.debug("Failed to persist trade event.")
 
     async def _close_all(self):
         """Flatten both legs at market."""
@@ -778,6 +906,28 @@ class AlpacaTradingBot:
             await asyncio.get_event_loop().run_in_executor(
                 None, self.trading_client.close_all_positions
             )
+            # reduce exposure tracking
+            if self.risk_manager and self._last_exposure:
+                try:
+                    self.risk_manager.record_exposure(self.strategy_name, -self._last_exposure)
+                except Exception:
+                    pass
+                self._last_exposure = 0.0
+            # persist close event
+            if self.results_store:
+                try:
+                    from datetime import datetime
+                    self.results_store.save_trade_event({
+                        "ts": datetime.now().isoformat(),
+                        "strategy": self.strategy_name,
+                        "symbol": f"{self.asset_a}/{self.asset_b}",
+                        "side": "EXIT",
+                        "qty": 0.0,
+                        "price": 0.0,
+                        "note": "closed_all",
+                    })
+                except Exception:
+                    log.debug("Failed to persist close event.")
             self.position = Position()
         except Exception as exc:
             log.error("Failed to close positions: %s", exc)
@@ -788,7 +938,7 @@ class AlpacaTradingBot:
         return StockDataStream(
             api_key=self.cfg["API_KEY"],
             secret_key=self.cfg["SECRET_KEY"],
-            feed="iex",   # use "sip" for live account
+            feed=DataFeed.IEX,   # use DataFeed.SIP for live account
         )
 
     async def _on_bar(self, bar):
@@ -807,6 +957,23 @@ class AlpacaTradingBot:
 
         signal = self.engine.evaluate(pa, pb, self.position)
 
+        # persist signal to results store if provided
+        if self.results_store:
+            try:
+                self.results_store.save_signal(self.strategy_name, symbol, signal.direction, signal.z_score)
+            except Exception:
+                log.debug("Failed to persist signal.")
+
+        log.info(
+            "LIVE SIGNAL | %s z=%.3f dir=%+d valid=%s pos=%+d lookback=%d",
+            symbol,
+            signal.z_score,
+            signal.direction,
+            signal.ou.valid,
+            self.position.direction if self.position.active else 0,
+            self.engine.lookback,
+        )
+
         log.debug(
             "BAR %s $%.4f | z=%.3f valid=%s dir=%+d",
             symbol, price, signal.z_score,
@@ -817,55 +984,55 @@ class AlpacaTradingBot:
             signal.direction != (self.position.direction if self.position.active else 0)
         )
         if needs_action:
-            if signal.direction == 0 and self.position.active:
-                log.info("EXIT SIGNAL | z=%.3f", signal.z_score)
-                await self._close_all()
-            elif signal.direction != 0:
-                log.info(
-                    "ENTRY SIGNAL | direction=%+d z=%.3f",
-                    signal.direction, signal.z_score,
-                )
-                if self.position.active:
-                    await self._close_all()
-                await self._execute_orders(signal)
+            if self._market_is_open():
+                await self._apply_signal(signal)
+            else:
+                self._queue_signal(signal, reason="market closed")
 
     # ── Main run loop ─────────────────────────────────────────────────────────
 
     async def run(self):
         """Entry point: warm up → connect WebSocket → stream forever."""
         await self._warmup()
+        self._pending_signal_task = asyncio.create_task(self._pending_signal_loop())
 
-        while self._reconnect_count <= self.MAX_RECONNECTS:
-            stream = self._build_stream()
-            stream.subscribe_bars(self._on_bar, self.asset_a, self.asset_b)
+        try:
+            while self._reconnect_count <= self.MAX_RECONNECTS:
+                stream = self._build_stream()
+                stream.subscribe_bars(self._on_bar, self.asset_a, self.asset_b)
 
-            log.info(
-                "Connecting to Alpaca WebSocket … (attempt %d)",
-                self._reconnect_count + 1,
-            )
-            try:
-                await stream.run()
-            except asyncio.CancelledError:
-                log.info("Stream cancelled by user — shutting down.")
-                await self._close_all()
-                break
-            except Exception as exc:
-                self._reconnect_count += 1
-                if self._reconnect_count > self.MAX_RECONNECTS:
-                    log.critical(
-                        "Max reconnects (%d) exceeded. Exiting.", self.MAX_RECONNECTS
-                    )
-                    await self._close_all()
-                    raise
-
-                wait = self.RECONNECT_DELAY * min(self._reconnect_count, 6)
-                log.warning(
-                    "WebSocket disconnected (%s). Reconnecting in %ds …", exc, wait
+                log.info(
+                    "Connecting to Alpaca WebSocket … (attempt %d)",
+                    self._reconnect_count + 1,
                 )
-                await asyncio.sleep(wait)
-            else:
-                # Clean exit from stream
-                self._reconnect_count = 0
+                try:
+                    await asyncio.to_thread(stream.run)
+                except asyncio.CancelledError:
+                    log.info("Stream cancelled by user — shutting down.")
+                    await self._close_all()
+                    break
+                except Exception as exc:
+                    self._reconnect_count += 1
+                    if self._reconnect_count > self.MAX_RECONNECTS:
+                        log.critical(
+                            "Max reconnects (%d) exceeded. Exiting.", self.MAX_RECONNECTS
+                        )
+                        await self._close_all()
+                        raise
+
+                    wait = self.RECONNECT_DELAY * min(self._reconnect_count, 6)
+                    log.warning(
+                        "WebSocket disconnected (%s). Reconnecting in %ds …", exc, wait
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    # Clean exit from stream
+                    self._reconnect_count = 0
+        finally:
+            if self._pending_signal_task is not None:
+                self._pending_signal_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._pending_signal_task
 
         log.info("AlpacaTradingBot stopped.")
 
@@ -888,45 +1055,78 @@ def fetch_historical_bars(
         api_key=cfg["API_KEY"],
         secret_key=cfg["SECRET_KEY"],
     )
-    tf_map = {
-        "1Day":  TimeFrame(1, TimeFrameUnit.Day),
-        "1Hour": TimeFrame(1, TimeFrameUnit.Hour),
-    }
-    tf = tf_map.get(cfg["BAR_TIMEFRAME"], TimeFrame(1, TimeFrameUnit.Day))
-
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=tf,
-        start=datetime.fromisoformat(start).replace(tzinfo=timezone.utc),
-        end=datetime.fromisoformat(end).replace(tzinfo=timezone.utc),
+    return fetch_stock_bars_frame(
+        client,
+        symbol,
+        datetime.fromisoformat(start).replace(tzinfo=timezone.utc),
+        datetime.fromisoformat(end).replace(tzinfo=timezone.utc),
+        cfg["BAR_TIMEFRAME"],
     )
-    bars = client.get_stock_bars(req)
-    sym_bars = bars.data.get(symbol, [])
-    if not sym_bars:
-        raise ValueError(f"No data returned for {symbol}")
 
-    records = [
-        {
-            "timestamp": b.timestamp,
-            "open":      b.open,
-            "high":      b.high,
-            "low":       b.low,
-            "close":     b.close,
-            "volume":    b.volume,
-        }
-        for b in sym_bars
-    ]
-    df = pd.DataFrame(records).set_index("timestamp")
-    df.index = pd.DatetimeIndex(df.index)
-    return df
+
+def select_pair_from_correlation_scan(cfg: dict) -> Optional[Tuple[str, str, Dict]]:
+    """
+    Discover correlated pairs using find_correlated_assets.py and select the
+    top-ranked candidate (fastest mean reversion).
+
+    Returns
+    -------
+    tuple(symbol_a, symbol_b) when found, else None.
+    """
+    try:
+        return discover_trade_pair("find_correlated_assets", cfg)
+    except Exception as exc:
+        log.warning("Correlation scan failed (%s). Using configured pair.", exc)
+        return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ═════════════════════════════════════════════════════════════════════════════
 
-def main():
-    cfg = CONFIG
+def run_strategy(runtime_config: Optional[dict] = None):
+    cfg = dict(CONFIG)
+    if runtime_config:
+        cfg.update(runtime_config)
+    if "CAPITAL" in cfg:
+        log.info(
+            "Strategy capital set to $%.2f (portfolio weight=%s)",
+            float(cfg["CAPITAL"]),
+            cfg.get("PORTFOLIO_WEIGHT", "n/a"),
+        )
+
+    selected = discover_trade_pair(cfg["PAIR_DISCOVERY_MODULE"], cfg)
+    if selected is None:
+        selected = select_pair_from_correlation_scan(cfg)
+
+    if selected is None:
+        log.info(
+            "Using configured pair from CONFIG: %s/%s",
+            cfg["ASSET_A"],
+            cfg["ASSET_B"],
+        )
+    else:
+        sym_a, sym_b, metrics = selected
+        cfg["ASSET_A"] = sym_a
+        cfg["ASSET_B"] = sym_b
+        log.info(
+            "Selected pair from discovery module: %s/%s (corr=%.3f, half-life=%.1f bars, ADF p=%.4f)",
+            sym_a,
+            sym_b,
+            metrics.get("correlation", float("nan")),
+            metrics.get("half_life", float("nan")),
+            metrics.get("adf_pvalue", float("nan")),
+        )
+
+    signal_engine = None
+    if cfg.get("SIGNAL_ENGINE_MODULE"):
+        signal_engine = build_signal_engine(
+            cfg["SIGNAL_ENGINE_MODULE"],
+            cfg,
+            cfg["ASSET_A"],
+            cfg["ASSET_B"],
+            lambda: None,
+        )
 
     if not cfg["RUN_LIVE"]:
         # ── BACKTEST MODE ────────────────────────────────────────────────────
@@ -993,12 +1193,16 @@ def main():
         except Exception as exc:
             log.warning("Pre-trade backtest failed (%s). Using defaults.", exc)
 
-        bot = AlpacaTradingBot(cfg, kelly_p=kelly_p, kelly_b=kelly_b)
+        bot = AlpacaTradingBot(cfg, kelly_p=kelly_p, kelly_b=kelly_b, engine=signal_engine)
 
         try:
             asyncio.run(bot.run())
         except KeyboardInterrupt:
             log.info("Keyboard interrupt received — shutting down gracefully.")
+
+
+def main():
+    return run_strategy()
 
 
 if __name__ == "__main__":
